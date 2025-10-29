@@ -1,0 +1,27 @@
+{
+  "name": "discord-youtube-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot that plays YouTube audio in voice channels",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node bot.js",
+    "setup": "node install.js"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "youtube",
+    "music",
+    "yt-dlp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@discordjs/voice": "^0.19.0",
+    "@snazzah/davey": "^0.1.7",
+    "discord.js": "^14.14.1",
+    "ffmpeg-static": "^5.2.0",
+    "youtube-dl-exec": "^2.4.13"
+  }
+}
