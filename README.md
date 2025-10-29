@@ -5,10 +5,14 @@ A Discord bot that can play YouTube audio in voice channels by simply pasting a 
 ## Features
 
 - 🎵 Play YouTube audio in voice channels
+- 📋 **Song queue system** - Add multiple songs and they'll play automatically
 - 🔗 Automatic YouTube URL detection
 - 📊 Rich embed messages with video information
 - 🎛️ Automatic audio quality selection
 - 🔄 Real-time status updates
+- ⏭️ **Queue management commands** - Skip, clear, view queue
+- 👤 **Track who requested each song**
+- 🤖 **Easy commands** - Simple ! commands for control
 - ❌ Comprehensive error handling
 
 ## Prerequisites
@@ -97,13 +101,20 @@ npm start
 
 2. Join a voice channel in your Discord server
 
-3. Paste a YouTube URL in any text channel where the bot has access
+3. **Add songs to queue:**
+   - Use `!play <YouTube URL>` or `!p <YouTube URL>` to add songs
+   - Example: `!play https://youtube.com/watch?v=dQw4w9WgXcQ`
+   - If it's the first song, it will start playing immediately
+   - Additional songs will be queued and play automatically
 
-4. The bot will automatically:
-   - Detect the YouTube URL
-   - Join your voice channel
-   - Extract and play the audio
-   - Display rich information about the video
+4. **Use commands to control playback:**
+   - `!play <URL>` or `!p <URL>` - Add a YouTube song to queue
+   - `!queue` or `!q` - View the current queue
+   - `!skip` or `!s` - Skip the current song
+   - `!nowplaying` or `!np` - Show current song info
+   - `!clear` - Clear all songs from queue (except current)
+   - `!stop` or `!leave` - Stop music and leave voice channel
+   - `!help` - Show all available commands
 
 ## Supported YouTube URL Formats
 
@@ -114,7 +125,21 @@ npm start
 
 ## Commands
 
-This bot doesn't use traditional commands. Simply paste a YouTube URL and the bot will handle the rest!
+### 🎵 Music Commands
+- `!play <URL>` or `!p <URL>` - Add a YouTube song to the queue
+- `!queue` or `!q` - Show the current music queue
+- `!skip` or `!s` - Skip the currently playing song
+- `!nowplaying` or `!np` - Show information about the current song
+- `!clear` - Clear all songs from the queue (except currently playing)
+- `!stop` or `!leave` - Stop music and leave the voice channel
+- `!help` - Show all available commands
+
+### 🎵 Adding Songs
+Use the `!play` command with a YouTube URL:
+- `!play https://youtube.com/watch?v=dQw4w9WgXcQ`
+- `!p https://youtu.be/dQw4w9WgXcQ`
+- The bot will add it to the queue and start playing if it's the first song
+- Shows rich information about the video
 
 ## Troubleshooting
 
