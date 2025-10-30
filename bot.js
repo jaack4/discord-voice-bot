@@ -62,6 +62,8 @@ async function handleCommand(message) {
         case 'skip':
         case 's':
             return skipSong(message);
+        case 'search':
+            return searchCommand(message, args);
         case 'clear':
             return clearQueue(message);
         case 'stop':
@@ -79,20 +81,12 @@ async function handleCommand(message) {
 
 // Play command handler
 async function playCommand(message, args) {
-    // Check if user provided a URL
+    // Check if user provided input
     if (args.length === 0) {
-        return message.reply('Please provide a YouTube URL! Example: `!play https://youtube.com/watch?v=...`');
+        return message.reply('Please provide a YouTube URL or search query! Example: `!play never gonna give you up`');
     }
 
     const input = args.join(' ');
-    
-    // Check if input contains a YouTube URL
-    const youtubeMatch = input.match(youtubeRegex);
-    if (!youtubeMatch) {
-        return message.reply('Please provide a valid YouTube URL!');
-    }
-
-    const videoUrl = youtubeMatch[0];
     
     // Check if user is in a voice channel
     const voiceChannel = message.member?.voice?.channel;
@@ -105,8 +99,216 @@ async function playCommand(message, args) {
         return message.reply('I need permissions to connect and speak in your voice channel!');
     }
 
+    let videoUrl;
+    
+    // Check if input contains a YouTube URL
+    const youtubeMatch = input.match(youtubeRegex);
+    if (youtubeMatch) {
+        // It's a URL, use it directly
+        videoUrl = youtubeMatch[0];
+    } else {
+        // It's a search query, search for it
+        try {
+            videoUrl = await searchYouTube(input, message);
+            if (!videoUrl) return; // Search failed or was cancelled
+        } catch (error) {
+            console.error('Search error:', error);
+            return message.reply('Failed to search for that song. Please try again.');
+        }
+    }
+
     // Add song to queue
     await addToQueue(message.guild.id, videoUrl, message.member, message.channel);
+}
+
+// Helper function to search YouTube
+async function searchYouTube(query, message) {
+    try {
+        // Send searching message
+        const searchingEmbed = new EmbedBuilder()
+            .setColor('#ffff00')
+            .setTitle('Searching...')
+            .setDescription(`Searching for: **${query}**`)
+            .setTimestamp();
+        
+        const searchMessage = await message.channel.send({ embeds: [searchingEmbed] });
+
+        // Use yt-dlp to search YouTube and get top result
+        const searchResult = await youtubedl('ytsearch1:' + query, {
+            dumpSingleJson: true,
+            noWarnings: true,
+            noCallHome: true,
+            noCheckCertificate: true,
+            flatPlaylist: true,
+            quiet: true,
+            noProgress: true
+        });
+
+        if (!searchResult.entries || searchResult.entries.length === 0) {
+            await searchMessage.edit({
+                embeds: [new EmbedBuilder()
+                    .setColor('#ff0000')
+                    .setTitle('Error')
+                    .setDescription(`No results found for: **${query}**`)
+                    .setTimestamp()]
+            });
+            return null;
+        }
+
+        const topResult = searchResult.entries[0];
+        const videoUrl = topResult.webpage_url || topResult.url;
+
+        // Delete the searching message
+        await searchMessage.delete();
+
+        return videoUrl;
+
+    } catch (error) {
+        console.error('Search error:', error);
+        throw error;
+    }
+}
+
+// Helper function to search YouTube with user selection
+async function searchYouTubeWithSelection(query, message) {
+    try {
+        // Send searching message
+        const searchingEmbed = new EmbedBuilder()
+            .setColor('#ffff00')
+            .setTitle('Searching...')
+            .setDescription(`Searching for: **${query}**`)
+            .setTimestamp();
+        
+        const searchMessage = await message.channel.send({ embeds: [searchingEmbed] });
+
+        // Use yt-dlp to search YouTube and get top 5 results
+        const searchResult = await youtubedl('ytsearch5:' + query, {
+            dumpSingleJson: true,
+            noWarnings: true,
+            noCallHome: true,
+            noCheckCertificate: true,
+            flatPlaylist: true,
+            quiet: true,
+            noProgress: true
+        });
+
+        if (!searchResult.entries || searchResult.entries.length === 0) {
+            await searchMessage.edit({
+                embeds: [new EmbedBuilder()
+                    .setColor('#ff0000')
+                    .setTitle('Error')
+                    .setDescription(`No results found for: **${query}**`)
+                    .setTimestamp()]
+            });
+            return null;
+        }
+
+        // Create selection embed with results
+        const results = searchResult.entries.slice(0, 5);
+        let description = `**Search results for:** ${query}\n\n`;
+        
+        results.forEach((result, index) => {
+            const duration = result.duration ? formatDuration(result.duration) : 'Unknown';
+            description += `**${index + 1}.** ${result.title}\n`;
+            description += `   *${result.uploader || 'Unknown'}* - ${duration}\n\n`;
+        });
+        
+        description += 'React with 1️⃣-5️⃣ to select a song, or ❌ to cancel.';
+
+        const selectionEmbed = new EmbedBuilder()
+            .setColor('#0099ff')
+            .setTitle('Select a Song')
+            .setDescription(description)
+            .setTimestamp();
+
+        await searchMessage.edit({ embeds: [selectionEmbed] });
+
+        // Add reaction options
+        const reactions = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣', '❌'];
+        for (let i = 0; i < Math.min(results.length, 5); i++) {
+            await searchMessage.react(reactions[i]);
+        }
+        await searchMessage.react('❌');
+
+        // Wait for user reaction
+        const filter = (reaction, user) => {
+            return reactions.includes(reaction.emoji.name) && user.id === message.author.id;
+        };
+
+        const collected = await searchMessage.awaitReactions({
+            filter,
+            max: 1,
+            time: 30000,
+            errors: ['time']
+        });
+
+        const reaction = collected.first();
+        
+        if (reaction.emoji.name === '❌') {
+            await searchMessage.edit({
+                embeds: [new EmbedBuilder()
+                    .setColor('#ffff00')
+                    .setTitle('Search Cancelled')
+                    .setDescription('Song selection cancelled.')
+                    .setTimestamp()]
+            });
+            return null;
+        }
+
+        // Get selected song
+        const selectedIndex = reactions.indexOf(reaction.emoji.name);
+        const selectedSong = results[selectedIndex];
+        
+        await searchMessage.delete();
+        
+        return selectedSong.webpage_url || selectedSong.url;
+
+    } catch (error) {
+        if (error.message && error.message.includes('time')) {
+            const timeoutEmbed = new EmbedBuilder()
+                .setColor('#ff0000')
+                .setTitle('Search Timeout')
+                .setDescription('Search timed out. Please try again.')
+                .setTimestamp();
+            
+            message.channel.send({ embeds: [timeoutEmbed] });
+            return null;
+        }
+        throw error;
+    }
+}
+
+// Search command handler
+async function searchCommand(message, args) {
+    // Check if user provided a search query
+    if (args.length === 0) {
+        return message.reply('Please provide a search query! Example: `!search never gonna give you up`');
+    }
+
+    const query = args.join(' ');
+    
+    // Check if user is in a voice channel
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) {
+        return message.reply('You need to be in a voice channel to play music dumbass.');
+    }
+
+    // Check bot permissions
+    if (!voiceChannel.permissionsFor(message.guild.members.me).has(['Connect', 'Speak'])) {
+        return message.reply('I need permissions to connect and speak in your voice channel!');
+    }
+
+    try {
+        const videoUrl = await searchYouTubeWithSelection(query, message);
+        if (!videoUrl) return; // Search failed or was cancelled
+
+        // Add song to queue
+        await addToQueue(message.guild.id, videoUrl, message.member, message.channel);
+
+    } catch (error) {
+        console.error('Search error:', error);
+        message.reply('Failed to search for that song. Please try again.');
+    }
 }
 
 // Add song to queue
@@ -429,9 +631,9 @@ async function showHelp(message) {
         .setTitle('Bot Commands')
         .setDescription('Commands:')
         .addFields(
-            { name: 'Music Commands', value: '`!play` or `!p <URL>` - Play a YouTube URL\n`!queue` or `!q` - Show current queue\n`!skip` or `!s` - Skip current song\n`!nowplaying` or `!np` - Show current song\n`!clear` - Clear the queue\n`!stop` or `!leave` - Stop music and leave', inline: false },
+            { name: 'Music Commands', value: '`!play` or `!p <URL/query>` - Play URL or search (auto-picks top result)\n`!search <query>` - Search and choose from 5 results\n`!queue` or `!q` - Show current queue\n`!skip` or `!s` - Skip current song\n`!nowplaying` or `!np` - Show current song\n`!clear` - Clear the queue\n`!stop` or `!leave` - Stop music and leave', inline: false },
             { name: 'Other Commands', value: '`!help` - Show this help message', inline: false },
-            { name: 'How to Play Music', value: 'Use `!play or !p <YouTube URL>` to add songs to the queue\nExample: `!play https://youtube.com/watch?v=...`', inline: false }
+            { name: 'How to Play Music', value: '**Quick play:** `!play <query>` - Auto-picks top result\n**Choose result:** `!search <query>` - Pick from 5 options\n**Direct URL:** `!play <URL>` - Play specific video\n\nExamples:\n`!play never gonna give you up` (instant)\n`!search bohemian rhapsody` (choose from list)', inline: false }
         )
         .setTimestamp();
 
@@ -448,6 +650,8 @@ async function getVideoInfo(url) {
             noCheckCertificate: true,
             preferFreeFormats: true,
             youtubeSkipDashManifest: true,
+            quiet: true,
+            noProgress: true
         });
         
         return {
@@ -471,6 +675,7 @@ async function getAudioStream(url) {
             noPlaylist: true,
             output: '-',
             quiet: true,
+            noProgress: true
         });
         
         return stream.stdout;
