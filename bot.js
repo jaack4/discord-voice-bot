@@ -632,7 +632,7 @@ async function showHelp(message) {
         .setDescription('Commands:')
         .addFields(
             { name: 'Music Commands', value: '`!play` or `!p <URL/query>` - Play URL or search (auto-picks top result)\n`!search <query>` - Search and choose from 5 results\n`!queue` or `!q` - Show current queue\n`!skip` or `!s` - Skip current song\n`!nowplaying` or `!np` - Show current song\n`!clear` - Clear the queue\n`!stop` or `!leave` - Stop music and leave', inline: false },
-            { name: 'Betting Commands', value: '`!pp <count> [sport]` - Get top PrizePicks bets for a slip\n`!ud <count> [sport]` - Get top Underdog bets for a slip\n\nExamples:\n`!pp 3` - Get top 3 PrizePicks bets (all sports)\n`!ud 5 NFL` - Get top 5 Underdog NFL bets\n`!pp 4 NBA` - Get top 4 PrizePicks NBA bets\n\nValid sports: NFL, NBA, NHL, MLB, NCAAF, NCAAB', inline: false },
+            { name: 'Betting Commands', value: '`!pp [count] [sport]` - Get PrizePicks bets for a slip\n`!ud [count] [sport]` - Get Underdog bets for a slip\n\nExamples:\n`!pp` - Get all PrizePicks bets (all unique players)\n`!pp 3` - Get top 3 PrizePicks bets (all sports)\n`!ud 5 NFL` - Get top 5 Underdog NFL bets\n`!pp NBA` - Get all PrizePicks NBA bets\n`!pp 4 NBA` - Get top 4 PrizePicks NBA bets\n\nValid sports: NFL, NBA', inline: false },
             { name: 'Other Commands', value: '`!help` - Show this help message', inline: false },
             { name: 'How to Play Music', value: '**Quick play:** `!play <query>` - Auto-picks top result\n**Choose result:** `!search <query>` - Pick from 5 options\n**Direct URL:** `!play <URL>` - Play specific video\n\nExamples:\n`!play never gonna give you up` (instant)\n`!search bohemian rhapsody` (choose from list)', inline: false }
         )
@@ -700,16 +700,22 @@ function formatDuration(seconds) {
 
 // Get EV bets command handler
 async function getBets(message, args, bookmaker) {
-    // Parse the slip count from args
-    const slipCount = parseInt(args[0]) || 5;
+    // Parse the slip count from args - if not provided, show all bets
+    let slipCount = null;
+    let sportArgIndex = 0;
     
-    // Validate slip count (common slip sizes are 2-6)
-    if (slipCount < 1 || slipCount > 20) {
-        return message.reply('Please provide a valid slip count between 1 and 20. Example: `!pp 3` or `!ud 5`');
+    if (args[0] && !isNaN(parseInt(args[0]))) {
+        slipCount = parseInt(args[0]);
+        sportArgIndex = 1;
+        
+        // Validate slip count
+        if (slipCount < 1 || slipCount > 20) {
+            return message.reply('Please provide a valid slip count between 1 and 20. Example: `!pp 3` or `!ud 5`');
+        }
     }
 
-    // Parse optional sport parameter (second argument)
-    const sport = args[1]?.toUpperCase();
+    // Parse optional sport parameter (first arg if no count, second arg if count provided)
+    const sport = args[sportArgIndex]?.toUpperCase();
     
     // Validate sport if provided
     const validSports = ['NFL', 'NBA', 'NHL', 'MLB', 'NCAAF', 'NCAAB'];
@@ -719,13 +725,14 @@ async function getBets(message, args, bookmaker) {
 
     const bookmakerName = bookmaker === 'prizepicks' ? 'PrizePicks' : 'Underdog';
     const sportText = sport ? ` ${sport}` : '';
+    const countText = slipCount ? `top ${slipCount}` : 'all';
 
     try {
         // Send loading message
         const loadingEmbed = new EmbedBuilder()
             .setColor('#ffff00')
             .setTitle('Fetching Bets...')
-            .setDescription(`Getting top ${slipCount}${sportText} ${bookmakerName} bets...`)
+            .setDescription(`Getting ${countText}${sportText} ${bookmakerName} bets...`)
             .setTimestamp();
         
         const loadingMessage = await message.channel.send({ embeds: [loadingEmbed] });
@@ -769,8 +776,8 @@ async function getBets(message, args, bookmaker) {
                 uniqueBets.push(bet);
                 seenPlayers.add(bet.player);
                 
-                // Stop once we have enough bets for the slip
-                if (uniqueBets.length >= slipCount) {
+                // Stop once we have enough bets for the slip (if count specified)
+                if (slipCount !== null && uniqueBets.length >= slipCount) {
                     break;
                 }
             }
@@ -778,8 +785,8 @@ async function getBets(message, args, bookmaker) {
 
         console.log(`Filtered to ${uniqueBets.length} unique player bets`);
 
-        // Check if we have enough unique bets
-        if (uniqueBets.length < slipCount) {
+        // Check if we have enough unique bets (only if count was specified)
+        if (slipCount !== null && uniqueBets.length < slipCount) {
             const warningEmbed = new EmbedBuilder()
                 .setColor('#FFA500')
                 .setTitle('Not Enough Unique Bets')
@@ -814,16 +821,58 @@ async function getBets(message, args, bookmaker) {
         const impliedOddsPerLeg = 122 / (122 + 100); // 0.5495 or 54.95%
         const breakevenOdds = (Math.pow(impliedOddsPerLeg, bets.length) * 100).toFixed(2);
         
+        // Find the most recent created_at time from the bets
+        let mostRecentUpdate = null;
+        if (bets.length > 0 && bets[0].created_at) {
+            const createdAts = bets.map(bet => new Date(bet.created_at)).filter(date => !isNaN(date.getTime()));
+            if (createdAts.length > 0) {
+                mostRecentUpdate = new Date(Math.max(...createdAts.map(d => d.getTime())));
+                console.log(`Most recent update (UTC): ${mostRecentUpdate.toISOString()}`);
+                console.log(`Most recent update (Local): ${mostRecentUpdate.toString()}`);
+            }
+        }
+        
+        // Format the update time for footer (West Coast time)
+        let footerText = '';
+        if (mostRecentUpdate) {
+            // Format in Pacific Time
+            const formatter = new Intl.DateTimeFormat('en-US', {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true,
+                timeZone: 'America/Los_Angeles'
+            });
+            
+            const formattedTime = formatter.format(mostRecentUpdate);
+            
+            // Get timezone abbreviation (PST/PDT)
+            const tzFormatter = new Intl.DateTimeFormat('en-US', {
+                timeZone: 'America/Los_Angeles',
+                timeZoneName: 'short'
+            });
+            const tzParts = tzFormatter.formatToParts(mostRecentUpdate);
+            const tzAbbr = tzParts.find(p => p.type === 'timeZoneName')?.value || 'PT';
+            
+            footerText += ` • Last updated: ${formattedTime} ${tzAbbr}`;
+        }
+        footerText += ' • Testing, assume EV values are inaccurate';
+        
+        const titleText = slipCount === null 
+            ? `${bookmakerName} - All Bets (${bets.length} unique players)`
+            : `${bookmakerName} - ${bets.length} Man Slip`;
+        
         const betsEmbed = new EmbedBuilder()
             .setColor(bookmaker === 'prizepicks' ? '#8B5CF6' : '#F59E0B')
-            .setTitle(`${bookmakerName} - ${bets.length} man slip`)
-            .setDescription(`*Breakeven: ${breakevenOdds}% chance to hit*\n\n${description}`)
+            .setTitle(titleText)
+            .setDescription(`*Assuming -122 odds for each leg (3-power)*\n\n${description}`)
             .addFields(
                 { name: 'Total Legs', value: bets.length.toString(), inline: true },
                 { name: 'Average EV', value: `${avgEV}%`, inline: true }
             )
-            .setFooter({ text: 'Sorted by highest EV' })
-            .setTimestamp();
+            .setFooter({ text: footerText })
+            .setTimestamp(mostRecentUpdate || undefined);
 
         await loadingMessage.edit({ embeds: [betsEmbed] });
 
