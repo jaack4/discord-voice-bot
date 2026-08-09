@@ -15,11 +15,27 @@ A Discord bot that can play YouTube audio in voice channels by simply pasting a 
 - 🤖 **Easy commands** - Simple ! commands for control
 - ❌ Comprehensive error handling
 
+## Voice Activation
+
+The bot automatically listens for commands whenever it is connected to Discord
+voice chat. Say "Hey Bart" or "Hey bot" to open an eight-second command window.
+Common transcription variants such as "Hey Bert" and "Hey bought" are accepted
+too. You can also say the wake phrase and command together: "Hey Bart, play Never
+Gonna Give You Up". Other examples include "Hey bot, skip this song" and "Hey
+Bart, show the queue". Run
+`!voice off` when you need the privacy kill switch.
+
+Voice activation records one speaker until they pause, transcribes that bounded
+audio locally with `whisper.cpp`, and only runs transcripts containing the
+configured wake phrase (or the next phrase during an armed command window). The
+bot does not save audio to disk or send it to a transcription service. Make sure
+people in the channel know when voice activation is enabled.
+
 ## Prerequisites
 
 Before running this bot, make sure you have:
 
-1. **Node.js** (version 16.9.0 or higher)
+1. **Node.js** (version 22.12.0 or higher)
 2. **FFmpeg** installed on your system
 3. A **Discord Bot Token**
 
@@ -77,6 +93,45 @@ module.exports = {
 Or set the environment variable:
 ```bash
 export DISCORD_BOT_TOKEN=your_actual_bot_token_here
+```
+
+Install the local CUDA-enabled `whisper.cpp` server and English `base.en` model:
+
+```bash
+npm run setup:whisper
+```
+
+The setup script automatically selects CUDA when an NVIDIA GPU is available and
+falls back to CPU otherwise. The CUDA setup also downloads NVIDIA's official
+cuBLAS redistributables into `whisper_runtime`; it does not install anything
+system-wide. Then copy the voice settings from `.env.example` to `.env`:
+
+```bash
+VOICE_WAKE_PHRASE=hey bart
+VOICE_SILENCE_MS=500
+VOICE_LOG_TRANSCRIPTS=true
+WHISPER_LANGUAGE=en
+WHISPER_SERVER_URL=http://127.0.0.1:8080/inference
+WHISPER_USE_GPU=true
+WHISPER_START_SERVER=true
+```
+
+With `VOICE_LOG_TRANSCRIPTS=true`, the console shows who spoke, recording
+duration, Whisper's exact transcript, transcription time, wake-phrase decisions,
+and the normalized command. Set it to `false` if you do not want spoken text
+written to the console.
+
+At startup, the bot runs one silent inference to warm the GPU. On older NVIDIA
+cards this can take around 20 seconds once, but subsequent short transcriptions
+are typically much faster.
+
+To make the bot join a specific voice channel automatically when it starts, also
+set the voice channel where it listens and the text channel where it posts command
+results:
+
+```bash
+VOICE_AUTOJOIN_CHANNEL_ID=your_discord_voice_channel_id
+VOICE_COMMAND_TEXT_CHANNEL_ID=your_discord_text_channel_id
 ```
 
 ### 5. Invite Bot to Your Server

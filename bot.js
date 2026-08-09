@@ -10,6 +10,10 @@ const {
 const youtubedl = require('youtube-dl-exec');
 const fs = require('fs');
 const path = require('path');
+const { VoiceCommandManager } = require('./voiceCommands');
+const { LocalWhisper } = require('./localWhisper');
+
+require('dotenv').config({ quiet: true });
 
 // Initialize Discord client
 const client = new Client({
@@ -26,13 +30,21 @@ const connections = new Map();
 const players = new Map();
 const queues = new Map(); // Guild ID -> Array of song objects
 const currentSongs = new Map(); // Guild ID -> Current song object
+let voiceCommands;
+let localWhisper;
 
 // YouTube URL regex pattern
 const youtubeRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/embed\/|youtube\.com\/v\/)([a-zA-Z0-9_-]{11})/;
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Bot is ready. Logged in as ${client.user.tag}`);
     console.log(`Serving ${client.guilds.cache.size} servers`);
+    try {
+        await localWhisper.start();
+    } catch (error) {
+        console.error('Local Whisper failed to start:', error.message);
+    }
+    await voiceCommands.autoJoinConfiguredChannel();
 });
 
 client.on('messageCreate', async (message) => {
@@ -69,6 +81,8 @@ async function handleCommand(message) {
         case 'stop':
         case 'leave':
             return stopAndLeave(message);
+        case 'stopmusic':
+            return stopMusic(message);
         case 'nowplaying':
         case 'np':
             return showNowPlaying(message);
@@ -78,8 +92,10 @@ async function handleCommand(message) {
             return getBets(message, args, 'underdog');
         case 'help':
             return showHelp(message);
+        case 'voice':
+            return voiceCommands.command(message, args);
         default:
-            return message.reply('Command doesn\'t exist retard');
+            return message.reply('That command does not exist. Use `!help` to see the available commands.');
     }
 }
 
@@ -95,7 +111,7 @@ async function playCommand(message, args) {
     // Check if user is in a voice channel
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) {
-        return message.reply('You need to be in a voice channel to play music dumbass.');
+        return message.reply('You need to be in a voice channel to play music.');
     }
 
     // Check bot permissions
@@ -290,7 +306,7 @@ async function searchCommand(message, args) {
     // Check if user is in a voice channel
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) {
-        return message.reply('You need to be in a voice channel to play music dumbass.');
+        return message.reply('You need to be in a voice channel to play music.');
     }
 
     // Check bot permissions
@@ -372,7 +388,7 @@ async function addToQueue(guildId, videoUrl, member, channel) {
         const errorEmbed = new EmbedBuilder()
             .setColor('#ff0000')
             .setTitle('Error')
-            .setDescription('Illegal URL retard')
+            .setDescription('That URL could not be processed.')
             .setTimestamp();
         
         channel.send({ embeds: [errorEmbed] });
@@ -385,11 +401,11 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
     if (!queue || queue.length === 0) {
         // Queue is empty, disconnect
         const connection = connections.get(guildId);
-        if (connection) {
+        currentSongs.delete(guildId);
+        if (connection && !voiceCommands.isEnabled(guildId)) {
             connection.destroy();
             connections.delete(guildId);
             players.delete(guildId);
-            currentSongs.delete(guildId);
         }
         
         const emptyEmbed = new EmbedBuilder()
@@ -413,8 +429,18 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
                 channelId: voiceChannel.id,
                 guildId: guildId,
                 adapterCreator: voiceChannel.guild.voiceAdapterCreator,
+                selfDeaf: !voiceCommands.canAutoActivate(guildId),
             });
             connections.set(guildId, connection);
+        }
+        const newlyActivated = voiceCommands.activateForConnection(guildId, connection, {
+            voiceChannelId: voiceChannel.id,
+            textChannelId: textChannel.id,
+        });
+        if (newlyActivated) {
+            await textChannel.send(
+                `🎙️ Always-listening voice activation is on. Say **${voiceCommands.wakePhrase}** to activate me. Speech turns are transcribed locally by Whisper and are not saved by this bot.`,
+            );
         }
 
         // Create audio player if not exists
@@ -425,22 +451,22 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
             connection.subscribe(player);
 
             // Handle player events
-            player.on(AudioPlayerStatus.Playing, () => {
-                console.log(`Playing: ${song.title}`);
+            player.on(AudioPlayerStatus.Playing, (_oldState, newState) => {
+                const playback = newState.resource.metadata;
+                if (!playback || playback.nowPlayingSent) return;
+
+                playback.nowPlayingSent = true;
+                console.log(`Playing: ${playback.song.title}`);
+                sendNowPlaying(playback.guildId, playback.song, playback.textChannel);
             });
 
-            player.on(AudioPlayerStatus.Idle, () => {
-                console.log('Song finished, playing next...');
-                // Remove current song from queue and play next
-                queue.shift();
-                setTimeout(() => playNextSong(guildId, voiceChannel, textChannel), 1000);
+            player.on(AudioPlayerStatus.Idle, (oldState) => {
+                finishPlayback(oldState.resource, null);
             });
 
             player.on('error', (error) => {
                 console.error('Audio player error:', error);
-                textChannel.send('An error occurred while playing the audio. Skipping to next song...');
-                queue.shift();
-                setTimeout(() => playNextSong(guildId, voiceChannel, textChannel), 1000);
+                finishPlayback(error.resource, error);
             });
         }
 
@@ -448,25 +474,17 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
         const audioStream = await getAudioStream(song.url);
         const resource = createAudioResource(audioStream, {
             inputType: 'arbitrary',
+            metadata: {
+                guildId,
+                song,
+                voiceChannel,
+                textChannel,
+                nowPlayingSent: false,
+            },
         });
 
         // Play the audio
         player.play(resource);
-
-        // Send now playing message
-        const playingEmbed = new EmbedBuilder()
-            .setColor('#00ff00')
-            .setTitle('🎵 Now Playing')
-            .setDescription(`**${song.title}**\nBy: ${song.uploader}`)
-            .setThumbnail(song.thumbnail)
-            .addFields(
-                { name: 'Duration', value: formatDuration(song.duration), inline: true },
-                { name: 'Requested By', value: song.requestedBy, inline: true },
-                { name: 'Queue Position', value: `1 of ${queue.length}`, inline: true }
-            )
-            .setTimestamp();
-        
-        textChannel.send({ embeds: [playingEmbed] });
 
     } catch (error) {
         console.error('Error playing song:', error);
@@ -474,6 +492,49 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
         queue.shift();
         setTimeout(() => playNextSong(guildId, voiceChannel, textChannel), 1000);
     }
+}
+
+function sendNowPlaying(guildId, song, textChannel) {
+    const queue = queues.get(guildId);
+    const playingEmbed = new EmbedBuilder()
+        .setColor('#00ff00')
+        .setTitle('🎵 Now Playing')
+        .setDescription(`**${song.title}**\nBy: ${song.uploader}`)
+        .setThumbnail(song.thumbnail)
+        .addFields(
+            { name: 'Duration', value: formatDuration(song.duration), inline: true },
+            { name: 'Requested By', value: song.requestedBy, inline: true },
+            { name: 'Queue Position', value: `1 of ${queue?.length || 1}`, inline: true }
+        )
+        .setTimestamp();
+
+    textChannel.send({ embeds: [playingEmbed] }).catch((error) => {
+        console.error('Failed to send now playing message:', error);
+    });
+}
+
+function finishPlayback(resource, error) {
+    const playback = resource?.metadata;
+    if (!playback) return;
+
+    const { guildId, song, voiceChannel, textChannel } = playback;
+    const queue = queues.get(guildId);
+
+    // Ignore duplicate Idle/error events and resources replaced by another song.
+    if (!queue || queue[0] !== song) return;
+
+    queue.shift();
+    currentSongs.delete(guildId);
+
+    if (error) {
+        textChannel.send('The audio stream failed. Skipping to the next song...').catch((sendError) => {
+            console.error('Failed to send playback error message:', sendError);
+        });
+    } else {
+        console.log(`Finished: ${song.title}`);
+    }
+
+    setTimeout(() => playNextSong(guildId, voiceChannel, textChannel), 1000);
 }
 
 // Show queue command
@@ -578,6 +639,7 @@ async function stopAndLeave(message) {
     }
 
     // Clear queue and stop player
+    voiceCommands.disable(message.guild.id, { updateConnection: false });
     queues.delete(message.guild.id);
     currentSongs.delete(message.guild.id);
     
@@ -598,6 +660,20 @@ async function stopAndLeave(message) {
         .setTimestamp();
 
     message.reply({ embeds: [stopEmbed] });
+}
+
+// Stop playback while keeping always-listening voice activation connected
+async function stopMusic(message) {
+    const player = players.get(message.guild.id);
+    const queue = queues.get(message.guild.id);
+
+    if (!player || !currentSongs.has(message.guild.id)) {
+        return message.reply('No music is currently playing.');
+    }
+
+    if (queue) queue.splice(1);
+    player.stop();
+    return message.reply('Music stopped. Voice activation is still listening.');
 }
 
 // Show now playing command
@@ -634,6 +710,7 @@ async function showHelp(message) {
             { name: 'Music Commands', value: '`!play` or `!p <URL/query>` - Play URL or search (auto-picks top result)\n`!search <query>` - Search and choose from 5 results\n`!queue` or `!q` - Show current queue\n`!skip` or `!s` - Skip current song\n`!nowplaying` or `!np` - Show current song\n`!clear` - Clear the queue\n`!stop` or `!leave` - Stop music and leave', inline: false },
             { name: 'Betting Commands', value: '`!pp [count] [sport]` - Get PrizePicks bets for a slip\n`!ud [count] [sport]` - Get Underdog bets for a slip\n\nExamples:\n`!pp` - Get all PrizePicks bets (all unique players)\n`!pp 3` - Get top 3 PrizePicks bets (all sports)\n`!ud 5 NFL` - Get top 5 Underdog NFL bets\n`!pp NBA` - Get all PrizePicks NBA bets\n`!pp 4 NBA` - Get top 4 PrizePicks NBA bets\n\nValid sports: NFL, NBA', inline: false },
             { name: 'Other Commands', value: '`!help` - Show this help message', inline: false },
+            { name: 'Voice Activation', value: 'Listening starts automatically whenever the bot joins voice.\n`!voice on` - Join immediately and listen\n`!voice off` - Stop voice activation\n`!voice status` - Show voice activation status\n\nSay **hey bart** or **hey bot** (common mishearings are accepted), then speak a command within 8 seconds—or say the wake phrase and command together.', inline: false },
             { name: 'How to Play Music', value: '**Quick play:** `!play <query>` - Auto-picks top result\n**Choose result:** `!search <query>` - Pick from 5 options\n**Direct URL:** `!play <URL>` - Play specific video\n\nExamples:\n`!play never gonna give you up` (instant)\n`!search bohemian rhapsody` (choose from list)', inline: false }
         )
         .setTimestamp();
@@ -667,20 +744,26 @@ async function getVideoInfo(url) {
 
 // Function to get audio stream
 async function getAudioStream(url) {
-    try {
-        // Use youtube-dl-exec to get the best audio format
-        const stream = youtubedl.exec(url, {
-            format: 'bestaudio',
-            noPlaylist: true,
-            output: '-',
-            quiet: true,
-        });
-        
-        return stream.stdout;
-    } catch (error) {
-        console.error('Error getting audio stream:', error);
-        throw new Error('Failed to get audio stream');
-    }
+    // Some videos only expose a combined audio/video format. Prefer audio-only,
+    // but fall back to the best combined stream instead of returning no audio.
+    const process = youtubedl.exec(url, {
+        format: 'bestaudio/best',
+        noPlaylist: true,
+        output: '-',
+        quiet: true,
+    });
+    const stream = process.stdout;
+
+    // yt-dlp failures happen after the subprocess starts. Forward them into the
+    // Discord audio pipeline rather than silently treating the failure as EOF.
+    process.catch((error) => {
+        console.error('yt-dlp audio stream failed:', error);
+        if (!stream.destroyed) {
+            stream.destroy(new Error('yt-dlp could not provide a playable audio stream'));
+        }
+    });
+
+    return stream;
 }
 
 // Function to format duration
@@ -904,6 +987,8 @@ function formatMarketName(market) {
 
 // Handle process termination
 process.on('SIGINT', () => {
+    voiceCommands.shutdown();
+    localWhisper.stop();
     console.log('\n🛑 Shutting down bot...');
     
     // Disconnect from all voice channels
@@ -928,20 +1013,96 @@ process.on('uncaughtException', (error) => {
 // Login with bot token
 let botToken;
 let apiUrl;
+let voiceWakePhrase;
+let autoJoinVoiceChannelId;
+let voiceCommandTextChannelId;
+let whisperEndpointUrl;
+let whisperExecutablePath;
+let whisperModelPath;
+let whisperLanguage;
+let whisperThreads;
+let whisperUseGpu;
+let whisperStartServer;
+let voiceSilenceMs;
+let voiceLogTranscripts;
 try {
     // Try to load from config.js first
     const config = require('./config.js');
-    botToken = config.DISCORD_BOT_TOKEN;
-    apiUrl = config.API_URL || 'http://localhost:8000';
+    botToken = process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_TOKEN || config.DISCORD_BOT_TOKEN;
+    apiUrl = process.env.API_URL || config.API_URL || 'http://localhost:8000';
+    voiceWakePhrase = process.env.VOICE_WAKE_PHRASE || config.VOICE_WAKE_PHRASE;
+    autoJoinVoiceChannelId = process.env.VOICE_AUTOJOIN_CHANNEL_ID || config.VOICE_AUTOJOIN_CHANNEL_ID;
+    voiceCommandTextChannelId = process.env.VOICE_COMMAND_TEXT_CHANNEL_ID || config.VOICE_COMMAND_TEXT_CHANNEL_ID;
+    whisperEndpointUrl = process.env.WHISPER_SERVER_URL || config.WHISPER_SERVER_URL;
+    whisperExecutablePath = process.env.WHISPER_EXECUTABLE_PATH || config.WHISPER_EXECUTABLE_PATH;
+    whisperModelPath = process.env.WHISPER_MODEL_PATH || config.WHISPER_MODEL_PATH;
+    whisperLanguage = process.env.WHISPER_LANGUAGE || config.WHISPER_LANGUAGE;
+    whisperThreads = process.env.WHISPER_THREADS || config.WHISPER_THREADS;
+    whisperUseGpu = process.env.WHISPER_USE_GPU ?? config.WHISPER_USE_GPU;
+    whisperStartServer = process.env.WHISPER_START_SERVER ?? config.WHISPER_START_SERVER;
+    voiceSilenceMs = process.env.VOICE_SILENCE_MS || config.VOICE_SILENCE_MS;
+    voiceLogTranscripts = process.env.VOICE_LOG_TRANSCRIPTS ?? config.VOICE_LOG_TRANSCRIPTS;
 } catch (error) {
     // Fall back to environment variable
-    botToken = process.env.DISCORD_BOT_TOKEN;
+    botToken = process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_TOKEN;
     apiUrl = process.env.API_URL || 'http://localhost:8000';
+    voiceWakePhrase = process.env.VOICE_WAKE_PHRASE;
+    autoJoinVoiceChannelId = process.env.VOICE_AUTOJOIN_CHANNEL_ID;
+    voiceCommandTextChannelId = process.env.VOICE_COMMAND_TEXT_CHANNEL_ID;
+    whisperEndpointUrl = process.env.WHISPER_SERVER_URL;
+    whisperExecutablePath = process.env.WHISPER_EXECUTABLE_PATH;
+    whisperModelPath = process.env.WHISPER_MODEL_PATH;
+    whisperLanguage = process.env.WHISPER_LANGUAGE;
+    whisperThreads = process.env.WHISPER_THREADS;
+    whisperUseGpu = process.env.WHISPER_USE_GPU;
+    whisperStartServer = process.env.WHISPER_START_SERVER;
+    voiceSilenceMs = process.env.VOICE_SILENCE_MS;
+    voiceLogTranscripts = process.env.VOICE_LOG_TRANSCRIPTS;
 }
 
 if (!botToken) {
     console.error('❌ No bot token found! Please set DISCORD_BOT_TOKEN environment variable or create config.js');
     process.exit(1);
 }
+
+const parseBoolean = (value, fallback) => {
+    if (value === undefined || value === null || value === '') return fallback;
+    return !['0', 'false', 'no', 'off'].includes(String(value).toLowerCase());
+};
+
+localWhisper = new LocalWhisper({
+    endpointUrl: whisperEndpointUrl || 'http://127.0.0.1:8080/inference',
+    executablePath: whisperExecutablePath,
+    modelPath: whisperModelPath,
+    language: whisperLanguage || 'en',
+    threads: Number.parseInt(whisperThreads, 10) || 4,
+    useGpu: parseBoolean(whisperUseGpu, true),
+    startServer: parseBoolean(whisperStartServer, true),
+});
+
+voiceCommands = new VoiceCommandManager({
+    client,
+    connections,
+    executeCommand: handleCommand,
+    transcriber: localWhisper,
+    wakePhrase: voiceWakePhrase || 'hey bart',
+    silenceMs: Number.parseInt(voiceSilenceMs, 10) || 500,
+    logTranscripts: parseBoolean(voiceLogTranscripts, true),
+    autoJoinVoiceChannelId,
+    commandTextChannelId: voiceCommandTextChannelId,
+    onDisable: (guildId) => {
+        const connection = connections.get(guildId);
+        if (!connection) return;
+
+        if (currentSongs.has(guildId)) {
+            connection.rejoin({ selfDeaf: true });
+            return;
+        }
+
+        connection.destroy();
+        connections.delete(guildId);
+        players.delete(guildId);
+    },
+});
 
 client.login(botToken);

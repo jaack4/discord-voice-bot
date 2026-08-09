@@ -69,3 +69,4 @@ Thumbs.db
 # Audio cache (if any)
 audio_cache/
 downloads/
+whisper_runtime/
