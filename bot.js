@@ -3,6 +3,7 @@ const {
     joinVoiceChannel, 
     createAudioPlayer, 
     createAudioResource, 
+    demuxProbe,
     AudioPlayerStatus,
     VoiceConnectionStatus,
     getVoiceConnection
@@ -101,6 +102,8 @@ async function handleCommand(message) {
 
 // Play command handler
 async function playCommand(message, args) {
+    const commandStartedAt = message.commandStartedAt || Date.now();
+
     // Check if user provided input
     if (args.length === 0) {
         return message.reply('Please provide a YouTube URL or search query! Example: `!play never gonna give you up`');
@@ -119,18 +122,18 @@ async function playCommand(message, args) {
         return message.reply('I need permissions to connect and speak in your voice channel!');
     }
 
-    let videoUrl;
+    let songCandidate;
     
     // Check if input contains a YouTube URL
     const youtubeMatch = input.match(youtubeRegex);
     if (youtubeMatch) {
         // It's a URL, use it directly
-        videoUrl = youtubeMatch[0];
+        songCandidate = { url: youtubeMatch[0] };
     } else {
         // It's a search query, search for it
         try {
-            videoUrl = await searchYouTube(input, message);
-            if (!videoUrl) return; // Search failed or was cancelled
+            songCandidate = await searchYouTube(input, message);
+            if (!songCandidate) return; // Search failed or was cancelled
         } catch (error) {
             console.error('Search error:', error);
             return message.reply('Failed to search for that song. Please try again.');
@@ -138,12 +141,52 @@ async function playCommand(message, args) {
     }
 
     // Add song to queue
-    await addToQueue(message.guild.id, videoUrl, message.member, message.channel);
+    await addToQueue(
+        message.guild.id,
+        songCandidate,
+        message.member,
+        message.channel,
+        commandStartedAt,
+    );
+}
+
+function getVideoUrl(info) {
+    if (info.webpage_url) return info.webpage_url;
+    if (typeof info.url === 'string' && /^https?:\/\//i.test(info.url)) return info.url;
+    if (info.id) return `https://www.youtube.com/watch?v=${info.id}`;
+    return info.url;
+}
+
+function createSongCandidate(info) {
+    return {
+        url: getVideoUrl(info),
+        title: info.title,
+        uploader: info.uploader || info.channel,
+        duration: info.duration,
+        thumbnail: info.thumbnail || info.thumbnails?.at(-1)?.url || info.thumbnails?.[0]?.url,
+    };
+}
+
+function hydrateSongMetadata(song) {
+    if (song.metadataPromise) return song.metadataPromise;
+
+    song.metadataPromise = getVideoInfo(song.url)
+        .then((videoInfo) => {
+            Object.assign(song, videoInfo);
+            return song;
+        })
+        .catch((error) => {
+            // Metadata is optional. Stream errors are handled by the player.
+            console.error('Could not hydrate video metadata:', error);
+            return song;
+        });
+    return song.metadataPromise;
 }
 
 // Helper function to search YouTube
 async function searchYouTube(query, message) {
     try {
+        const searchStartedAt = Date.now();
         // Send searching message
         const searchingEmbed = new EmbedBuilder()
             .setColor('#ffff00')
@@ -151,19 +194,26 @@ async function searchYouTube(query, message) {
             .setDescription(`Searching for: **${query}**`)
             .setTimestamp();
         
-        const searchMessage = await message.channel.send({ embeds: [searchingEmbed] });
+        const searchMessagePromise = message.channel.send({ embeds: [searchingEmbed] })
+            .catch((error) => {
+                console.error('Failed to send searching message:', error);
+                return null;
+            });
 
         // Use yt-dlp to search YouTube and get top result
-        const searchResult = await youtubedl('ytsearch1:' + query, {
+        const searchResultPromise = youtubedl('ytsearch1:' + query, {
             dumpSingleJson: true,
             noWarnings: true,
             noCallHome: true,
             noCheckCertificate: true,
             flatPlaylist: true,
         });
+        const searchResult = await searchResultPromise;
+        console.log(`[latency] YouTube search completed in ${Date.now() - searchStartedAt} ms`);
 
         if (!searchResult.entries || searchResult.entries.length === 0) {
-            await searchMessage.edit({
+            const searchMessage = await searchMessagePromise;
+            await searchMessage?.edit({
                 embeds: [new EmbedBuilder()
                     .setColor('#ff0000')
                     .setTitle('Error')
@@ -174,12 +224,13 @@ async function searchYouTube(query, message) {
         }
 
         const topResult = searchResult.entries[0];
-        const videoUrl = topResult.webpage_url || topResult.url;
+        const songCandidate = createSongCandidate(topResult);
 
-        // Delete the searching message
-        await searchMessage.delete();
+        searchMessagePromise
+            .then((searchMessage) => searchMessage?.delete())
+            .catch((error) => console.error('Failed to delete searching message:', error));
 
-        return videoUrl;
+        return songCandidate;
 
     } catch (error) {
         console.error('Search error:', error);
@@ -190,6 +241,7 @@ async function searchYouTube(query, message) {
 // Helper function to search YouTube with user selection
 async function searchYouTubeWithSelection(query, message) {
     try {
+        const searchStartedAt = Date.now();
         // Send searching message
         const searchingEmbed = new EmbedBuilder()
             .setColor('#ffff00')
@@ -197,16 +249,21 @@ async function searchYouTubeWithSelection(query, message) {
             .setDescription(`Searching for: **${query}**`)
             .setTimestamp();
         
-        const searchMessage = await message.channel.send({ embeds: [searchingEmbed] });
+        const searchMessagePromise = message.channel.send({ embeds: [searchingEmbed] });
 
         // Use yt-dlp to search YouTube and get top 5 results
-        const searchResult = await youtubedl('ytsearch5:' + query, {
+        const searchResultPromise = youtubedl('ytsearch5:' + query, {
             dumpSingleJson: true,
             noWarnings: true,
             noCallHome: true,
             noCheckCertificate: true,
             flatPlaylist: true,
         });
+        const [searchResult, searchMessage] = await Promise.all([
+            searchResultPromise,
+            searchMessagePromise,
+        ]);
+        console.log(`[latency] YouTube selection search completed in ${Date.now() - searchStartedAt} ms`);
 
         if (!searchResult.entries || searchResult.entries.length === 0) {
             await searchMessage.edit({
@@ -275,9 +332,11 @@ async function searchYouTubeWithSelection(query, message) {
         const selectedIndex = reactions.indexOf(reaction.emoji.name);
         const selectedSong = results[selectedIndex];
         
-        await searchMessage.delete();
+        searchMessage.delete().catch((error) => {
+            console.error('Failed to delete search selection message:', error);
+        });
         
-        return selectedSong.webpage_url || selectedSong.url;
+        return createSongCandidate(selectedSong);
 
     } catch (error) {
         if (error.message && error.message.includes('time')) {
@@ -296,6 +355,8 @@ async function searchYouTubeWithSelection(query, message) {
 
 // Search command handler
 async function searchCommand(message, args) {
+    const commandStartedAt = message.commandStartedAt || Date.now();
+
     // Check if user provided a search query
     if (args.length === 0) {
         return message.reply('Please provide a search query! Example: `!search never gonna give you up`');
@@ -315,11 +376,17 @@ async function searchCommand(message, args) {
     }
 
     try {
-        const videoUrl = await searchYouTubeWithSelection(query, message);
-        if (!videoUrl) return; // Search failed or was cancelled
+        const songCandidate = await searchYouTubeWithSelection(query, message);
+        if (!songCandidate) return; // Search failed or was cancelled
 
         // Add song to queue
-        await addToQueue(message.guild.id, videoUrl, message.member, message.channel);
+        await addToQueue(
+            message.guild.id,
+            songCandidate,
+            message.member,
+            message.channel,
+            commandStartedAt,
+        );
 
     } catch (error) {
         console.error('Search error:', error);
@@ -328,7 +395,7 @@ async function searchCommand(message, args) {
 }
 
 // Add song to queue
-async function addToQueue(guildId, videoUrl, member, channel) {
+async function addToQueue(guildId, songCandidate, member, channel, commandStartedAt = Date.now()) {
     try {
         // Send loading message
         const loadingEmbed = new EmbedBuilder()
@@ -337,21 +404,27 @@ async function addToQueue(guildId, videoUrl, member, channel) {
             .setDescription('Fetching video information...')
             .setTimestamp();
         
-        const loadingMessage = await channel.send({ embeds: [loadingEmbed] });
-
-        // Get video info
-        const videoInfo = await getVideoInfo(videoUrl);
+        const loadingMessagePromise = channel.send({ embeds: [loadingEmbed] })
+            .catch((error) => {
+                console.error('Failed to send processing message:', error);
+                return null;
+            });
         
-        // Create song object
+        // Search results already have metadata. Direct URLs can begin playback
+        // while their display metadata is fetched in parallel.
         const song = {
-            url: videoUrl,
-            title: videoInfo.title,
-            uploader: videoInfo.uploader,
-            duration: videoInfo.duration,
-            thumbnail: videoInfo.thumbnail,
+            url: songCandidate.url,
+            title: songCandidate.title || 'YouTube audio',
+            uploader: songCandidate.uploader || 'Unknown Uploader',
+            duration: songCandidate.duration || 0,
+            thumbnail: songCandidate.thumbnail || null,
             requestedBy: member.user.tag,
-            requestedById: member.user.id
+            requestedById: member.user.id,
+            commandStartedAt,
         };
+        if (songCandidate.title) {
+            song.metadataPromise = Promise.resolve(song);
+        }
 
         // Initialize queue if it doesn't exist
         if (!queues.has(guildId)) {
@@ -363,9 +436,14 @@ async function addToQueue(guildId, videoUrl, member, channel) {
 
         // If this is the first song, start playing
         if (queue.length === 1) {
-            await loadingMessage.delete();
+            loadingMessagePromise.then((loadingMessage) => loadingMessage?.delete())
+                .catch((error) => console.error('Failed to delete processing message:', error));
             await playNextSong(guildId, member.voice.channel, channel);
         } else {
+            const [loadingMessage] = await Promise.all([
+                loadingMessagePromise,
+                hydrateSongMetadata(song),
+            ]);
             // Update loading message to show added to queue
             const queuedEmbed = new EmbedBuilder()
                 .setColor('#00ff00')
@@ -379,7 +457,7 @@ async function addToQueue(guildId, videoUrl, member, channel) {
                 )
                 .setTimestamp();
             
-            await loadingMessage.edit({ embeds: [queuedEmbed] });
+            await loadingMessage?.edit({ embeds: [queuedEmbed] });
         }
 
     } catch (error) {
@@ -438,9 +516,9 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
             textChannelId: textChannel.id,
         });
         if (newlyActivated) {
-            await textChannel.send(
+            textChannel.send(
                 `🎙️ Always-listening voice activation is on. Say **${voiceCommands.wakePhrase}** to activate me. Speech turns are transcribed locally by Whisper and are not saved by this bot.`,
-            );
+            ).catch((error) => console.error('Failed to send voice activation message:', error));
         }
 
         // Create audio player if not exists
@@ -456,8 +534,15 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
                 if (!playback || playback.nowPlayingSent) return;
 
                 playback.nowPlayingSent = true;
-                console.log(`Playing: ${playback.song.title}`);
-                sendNowPlaying(playback.guildId, playback.song, playback.textChannel);
+                const totalMs = Date.now() - playback.song.commandStartedAt;
+                const playerStartupMs = Date.now() - playback.streamRequestedAt;
+                console.log(
+                    `[latency] Playback started in ${totalMs} ms total `
+                    + `(${playerStartupMs} ms from stream request): ${playback.song.title}`,
+                );
+                hydrateSongMetadata(playback.song)
+                    .then(() => sendNowPlaying(playback.guildId, playback.song, playback.textChannel))
+                    .catch((error) => console.error('Failed to prepare now-playing metadata:', error));
             });
 
             player.on(AudioPlayerStatus.Idle, (oldState) => {
@@ -471,14 +556,24 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
         }
 
         // Get audio stream and create resource
-        const audioStream = await getAudioStream(song.url);
-        const resource = createAudioResource(audioStream, {
-            inputType: 'arbitrary',
+        const streamRequestedAt = Date.now();
+        const audioStream = getAudioStream(song.url);
+        const probeStartedAt = Date.now();
+        const { stream: probedStream, type: inputType } = await demuxProbe(audioStream);
+        console.log(
+            `[latency] yt-dlp produced probe bytes in ${Date.now() - streamRequestedAt} ms; `
+            + `audio probe selected ${inputType} in ${Date.now() - probeStartedAt} ms`,
+        );
+        const resource = createAudioResource(probedStream, {
+            // WebM/Ogg Opus can pass straight through to Discord. Other formats
+            // remain arbitrary and automatically use the FFmpeg fallback.
+            inputType,
             metadata: {
                 guildId,
                 song,
                 voiceChannel,
                 textChannel,
+                streamRequestedAt,
                 nowPlayingSent: false,
             },
         });
@@ -490,7 +585,7 @@ async function playNextSong(guildId, voiceChannel, textChannel) {
         console.error('Error playing song:', error);
         textChannel.send('Failed to play the current song. Skipping to next...');
         queue.shift();
-        setTimeout(() => playNextSong(guildId, voiceChannel, textChannel), 1000);
+        setImmediate(() => playNextSong(guildId, voiceChannel, textChannel));
     }
 }
 
@@ -534,7 +629,7 @@ function finishPlayback(resource, error) {
         console.log(`Finished: ${song.title}`);
     }
 
-    setTimeout(() => playNextSong(guildId, voiceChannel, textChannel), 1000);
+    setImmediate(() => playNextSong(guildId, voiceChannel, textChannel));
 }
 
 // Show queue command
@@ -743,11 +838,13 @@ async function getVideoInfo(url) {
 }
 
 // Function to get audio stream
-async function getAudioStream(url) {
+function getAudioStream(url) {
     // Some videos only expose a combined audio/video format. Prefer audio-only,
     // but fall back to the best combined stream instead of returning no audio.
     const process = youtubedl.exec(url, {
-        format: 'bestaudio/best',
+        // Prefer Discord-ready Opus to avoid transcoding, with the old generic
+        // choices retained as fallbacks for videos that do not expose it.
+        format: 'bestaudio[ext=webm][acodec=opus]/bestaudio/best',
         noPlaylist: true,
         output: '-',
         quiet: true,

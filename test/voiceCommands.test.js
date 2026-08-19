@@ -125,6 +125,41 @@ test('transcribes a wake-phrase command and routes it to the command handler', a
     assert.ok(logs.some((line) => line.includes('command recognized: !skip')));
 });
 
+test('does not wait for the Discord acknowledgement before executing a voice command', async () => {
+    let releaseAcknowledgement;
+    const acknowledgement = new Promise((resolve) => {
+        releaseAcknowledgement = resolve;
+    });
+    const executed = [];
+    const channel = {
+        isTextBased: () => true,
+        send: () => acknowledgement,
+    };
+    const guild = {
+        channels: { cache: new Map([['text-channel', channel]]) },
+    };
+    const member = {
+        displayName: 'Listener',
+        user: { id: 'user-1' },
+        guild,
+    };
+    const manager = new VoiceCommandManager({
+        client: {},
+        connections: new Map(),
+        executeCommand: async (message) => executed.push(message.content),
+        transcriber: readyTranscriber(['Hey Bart, play Dreams.']),
+        wakePhrase: 'hey bart',
+    });
+    manager.enabledGuilds.set('guild-1', { textChannelId: 'text-channel' });
+
+    const transcription = manager.transcribeAndExecute('guild-1', member, Buffer.alloc(128));
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(executed, ['!play Dreams']);
+    releaseAcknowledgement();
+    await transcription;
+});
+
 test('saying only the wake phrase arms the next utterance', async () => {
     const sent = [];
     const executed = [];

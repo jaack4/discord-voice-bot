@@ -495,15 +495,21 @@ class VoiceCommandManager {
         this.voiceLog(guildId, member, `command recognized: !${normalized}`);
 
         const displayedCommand = normalized === 'stopmusic' ? 'stop music' : normalized;
-        await channel.send(`🎙️ **${member.displayName}**: \`${displayedCommand}\``);
+        // Start the acknowledgement and command concurrently. Discord REST
+        // latency should not hold up search or playback.
+        const acknowledgementPromise = channel
+            .send(`🎙️ **${member.displayName}**: \`${displayedCommand}\``)
+            .catch((error) => console.error('Failed to acknowledge voice command:', error));
         await this.executeCommand({
             content: `!${normalized}`,
             author: member.user,
             member,
             guild: member.guild,
             channel,
+            commandStartedAt: Date.now(),
             reply: (payload) => channel.send(payload),
         });
+        await acknowledgementPromise;
     }
 
     extractCommand(transcript) {
