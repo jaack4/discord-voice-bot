@@ -87,10 +87,6 @@ async function handleCommand(message) {
         case 'nowplaying':
         case 'np':
             return showNowPlaying(message);
-        case 'pp':
-            return getBets(message, args, 'prizepicks');
-        case 'ud':
-            return getBets(message, args, 'underdog');
         case 'help':
             return showHelp(message);
         case 'voice':
@@ -803,7 +799,6 @@ async function showHelp(message) {
         .setDescription('Commands:')
         .addFields(
             { name: 'Music Commands', value: '`!play` or `!p <URL/query>` - Play URL or search (auto-picks top result)\n`!search <query>` - Search and choose from 5 results\n`!queue` or `!q` - Show current queue\n`!skip` or `!s` - Skip current song\n`!nowplaying` or `!np` - Show current song\n`!clear` - Clear the queue\n`!stop` or `!leave` - Stop music and leave', inline: false },
-            { name: 'Betting Commands', value: '`!pp [count] [sport]` - Get PrizePicks bets for a slip\n`!ud [count] [sport]` - Get Underdog bets for a slip\n\nExamples:\n`!pp` - Get all PrizePicks bets (all unique players)\n`!pp 3` - Get top 3 PrizePicks bets (all sports)\n`!ud 5 NFL` - Get top 5 Underdog NFL bets\n`!pp NBA` - Get all PrizePicks NBA bets\n`!pp 4 NBA` - Get top 4 PrizePicks NBA bets\n\nValid sports: NFL, NBA', inline: false },
             { name: 'Other Commands', value: '`!help` - Show this help message', inline: false },
             { name: 'Voice Activation', value: 'Listening starts automatically whenever the bot joins voice.\n`!voice on` - Join immediately and listen\n`!voice off` - Stop voice activation\n`!voice status` - Show voice activation status\n\nSay **hey bart** or **hey bot** (common mishearings are accepted), then speak a command within 8 seconds—or say the wake phrase and command together.', inline: false },
             { name: 'How to Play Music', value: '**Quick play:** `!play <query>` - Auto-picks top result\n**Choose result:** `!search <query>` - Pick from 5 options\n**Direct URL:** `!play <URL>` - Play specific video\n\nExamples:\n`!play never gonna give you up` (instant)\n`!search bohemian rhapsody` (choose from list)', inline: false }
@@ -878,210 +873,6 @@ function formatDuration(seconds) {
     }
 }
 
-// Get EV bets command handler
-async function getBets(message, args, bookmaker) {
-    // Parse the slip count from args - if not provided, show all bets
-    let slipCount = null;
-    let sportArgIndex = 0;
-    
-    if (args[0] && !isNaN(parseInt(args[0]))) {
-        slipCount = parseInt(args[0]);
-        sportArgIndex = 1;
-        
-        // Validate slip count
-        if (slipCount < 1 || slipCount > 20) {
-            return message.reply('Please provide a valid slip count between 1 and 20. Example: `!pp 3` or `!ud 5`');
-        }
-    }
-
-    // Parse optional sport parameter (first arg if no count, second arg if count provided)
-    const sport = args[sportArgIndex]?.toUpperCase();
-    
-    // Validate sport if provided
-    const validSports = ['NFL', 'NBA', 'NHL', 'MLB', 'NCAAF', 'NCAAB'];
-    if (sport && !validSports.includes(sport)) {
-        return message.reply(`Invalid sport. Valid options: ${validSports.join(', ')}. Example: \`!pp 3 NFL\` or \`!ud 5 NBA\``);
-    }
-
-    const bookmakerName = bookmaker === 'prizepicks' ? 'PrizePicks' : 'Underdog';
-    const sportText = sport ? ` ${sport}` : '';
-    const countText = slipCount ? `top ${slipCount}` : 'all';
-
-    try {
-        // Send loading message
-        const loadingEmbed = new EmbedBuilder()
-            .setColor('#ffff00')
-            .setTitle('Fetching Bets...')
-            .setDescription(`Getting ${countText}${sportText} ${bookmakerName} bets...`)
-            .setTimestamp();
-        
-        const loadingMessage = await message.channel.send({ embeds: [loadingEmbed] });
-
-        // Build API URL with optional sport filter - fetch all bets (no limit)
-        let apiUrlWithParams = `${apiUrl}/bets?bookmaker=${bookmaker}&limit=500`;
-        if (sport) {
-            apiUrlWithParams += `&sport=${sport}`;
-        }
-
-        console.log(`Fetching bets: ${apiUrlWithParams}`);
-        console.log(`Requested slip count: ${slipCount}, Sport: ${sport || 'All'}`);
-
-        // Fetch bets from API
-        const response = await fetch(apiUrlWithParams);
-        
-        if (!response.ok) {
-            throw new Error(`API returned status ${response.status}`);
-        }
-
-        const allBets = await response.json();
-
-        console.log(`Received ${allBets.length} bets from API`);
-
-        if (!allBets || allBets.length === 0) {
-            const noDataEmbed = new EmbedBuilder()
-                .setColor('#ff0000')
-                .setTitle('No Bets Found')
-                .setDescription(`No active ${bookmakerName} bets found.`)
-                .setTimestamp();
-            
-            return loadingMessage.edit({ embeds: [noDataEmbed] });
-        }
-
-        // Filter bets to ensure unique players (sorted by EV, already sorted from API)
-        const uniqueBets = [];
-        const seenPlayers = new Set();
-
-        for (const bet of allBets) {
-            if (!seenPlayers.has(bet.player)) {
-                uniqueBets.push(bet);
-                seenPlayers.add(bet.player);
-                
-                // Stop once we have enough bets for the slip (if count specified)
-                if (slipCount !== null && uniqueBets.length >= slipCount) {
-                    break;
-                }
-            }
-        }
-
-        console.log(`Filtered to ${uniqueBets.length} unique player bets`);
-
-        // Check if we have enough unique bets (only if count was specified)
-        if (slipCount !== null && uniqueBets.length < slipCount) {
-            const warningEmbed = new EmbedBuilder()
-                .setColor('#FFA500')
-                .setTitle('Not Enough Unique Bets')
-                .setDescription(`Only found ${uniqueBets.length} unique player bets for ${bookmakerName}${sportText}. Showing all available.`)
-                .setTimestamp();
-            
-            await loadingMessage.edit({ embeds: [warningEmbed] });
-            await new Promise(resolve => setTimeout(resolve, 2000)); // Show warning for 2 seconds
-        }
-
-        const bets = uniqueBets;
-
-        // Build the bets display
-        let description = '';
-        let totalEV = 0;
-
-        bets.forEach((bet, index) => {
-            const evPercent = bet.ev_percent?.toFixed(2) || '0.00';
-            const trueProb = bet.true_prob ? (bet.true_prob * 100).toFixed(2) : 'N/A';
-            totalEV += parseFloat(bet.ev_percent) || 0;
-            
-            description += `**${index + 1}. ${bet.player}** - ${formatMarketName(bet.market)} **${bet.outcome}** ${bet.betting_line}\n`;
-            description += `   EV: **${evPercent}%** | True Prob: **${trueProb}%** | Sharp Mean: **${bet.sharp_mean}** | ${bet.sport_title}\n\n`;
-        });
-
-        // Calculate average EV
-        const avgEV = (totalEV / bets.length).toFixed(2);
-
-        // Calculate breakeven odds for this slip size
-        // At -122, each leg has 54.95% implied probability
-        // Breakeven for n legs: (0.5495)^n
-        const impliedOddsPerLeg = 122 / (122 + 100); // 0.5495 or 54.95%
-        const breakevenOdds = (Math.pow(impliedOddsPerLeg, bets.length) * 100).toFixed(2);
-        
-        // Find the most recent created_at time from the bets
-        let mostRecentUpdate = null;
-        if (bets.length > 0 && bets[0].created_at) {
-            const createdAts = bets.map(bet => new Date(bet.created_at)).filter(date => !isNaN(date.getTime()));
-            if (createdAts.length > 0) {
-                mostRecentUpdate = new Date(Math.max(...createdAts.map(d => d.getTime())));
-                console.log(`Most recent update (UTC): ${mostRecentUpdate.toISOString()}`);
-                console.log(`Most recent update (Local): ${mostRecentUpdate.toString()}`);
-            }
-        }
-        
-        // Format the update time for footer (West Coast time)
-        let footerText = '';
-        if (mostRecentUpdate) {
-            // Format in Pacific Time
-            const formatter = new Intl.DateTimeFormat('en-US', {
-                month: 'short',
-                day: 'numeric',
-                hour: 'numeric',
-                minute: '2-digit',
-                hour12: true,
-                timeZone: 'America/Los_Angeles'
-            });
-            
-            const formattedTime = formatter.format(mostRecentUpdate);
-            
-            // Get timezone abbreviation (PST/PDT)
-            const tzFormatter = new Intl.DateTimeFormat('en-US', {
-                timeZone: 'America/Los_Angeles',
-                timeZoneName: 'short'
-            });
-            const tzParts = tzFormatter.formatToParts(mostRecentUpdate);
-            const tzAbbr = tzParts.find(p => p.type === 'timeZoneName')?.value || 'PT';
-            
-            footerText += ` • Last updated: ${formattedTime} ${tzAbbr}`;
-        }
-        footerText += ' • Testing, assume EV values are inaccurate';
-        
-        const titleText = slipCount === null 
-            ? `${bookmakerName} - All Bets (${bets.length} unique players)`
-            : `${bookmakerName} - ${bets.length} Man Slip`;
-        
-        const betsEmbed = new EmbedBuilder()
-            .setColor(bookmaker === 'prizepicks' ? '#8B5CF6' : '#F59E0B')
-            .setTitle(titleText)
-            .setDescription(`*Assuming -122 odds for each leg (3-power)*\n\n${description}`)
-            .addFields(
-                { name: 'Total Legs', value: bets.length.toString(), inline: true },
-                { name: 'Average EV', value: `${avgEV}%`, inline: true }
-            )
-            .setFooter({ text: footerText })
-            .setTimestamp(mostRecentUpdate || undefined);
-
-        await loadingMessage.edit({ embeds: [betsEmbed] });
-
-    } catch (error) {
-        console.error('Error fetching bets:', error);
-        
-        const errorEmbed = new EmbedBuilder()
-            .setColor('#ff0000')
-            .setTitle('Error')
-            .setDescription(`Failed to fetch ${bookmakerName} bets. Make sure the API is running.`)
-            .setTimestamp();
-        
-        message.channel.send({ embeds: [errorEmbed] });
-    }
-}
-
-// Helper function to format market names
-function formatMarketName(market) {
-    if (!market) return 'Unknown';
-    
-    // Convert snake_case to readable format
-    const formatted = market
-        .replace('player_', '')
-        .replace(/_/g, ' ')
-        .replace(/\b\w/g, c => c.toUpperCase());
-    
-    return formatted;
-}
-
 // Handle process termination
 process.on('SIGINT', () => {
     voiceCommands.shutdown();
@@ -1109,7 +900,6 @@ process.on('uncaughtException', (error) => {
 
 // Login with bot token
 let botToken;
-let apiUrl;
 let voiceWakePhrase;
 let autoJoinVoiceChannelId;
 let voiceCommandTextChannelId;
@@ -1126,7 +916,6 @@ try {
     // Try to load from config.js first
     const config = require('./config.js');
     botToken = process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_TOKEN || config.DISCORD_BOT_TOKEN;
-    apiUrl = process.env.API_URL || config.API_URL || 'http://localhost:8000';
     voiceWakePhrase = process.env.VOICE_WAKE_PHRASE || config.VOICE_WAKE_PHRASE;
     autoJoinVoiceChannelId = process.env.VOICE_AUTOJOIN_CHANNEL_ID || config.VOICE_AUTOJOIN_CHANNEL_ID;
     voiceCommandTextChannelId = process.env.VOICE_COMMAND_TEXT_CHANNEL_ID || config.VOICE_COMMAND_TEXT_CHANNEL_ID;
@@ -1142,7 +931,6 @@ try {
 } catch (error) {
     // Fall back to environment variable
     botToken = process.env.DISCORD_BOT_TOKEN || process.env.DISCORD_TOKEN;
-    apiUrl = process.env.API_URL || 'http://localhost:8000';
     voiceWakePhrase = process.env.VOICE_WAKE_PHRASE;
     autoJoinVoiceChannelId = process.env.VOICE_AUTOJOIN_CHANNEL_ID;
     voiceCommandTextChannelId = process.env.VOICE_COMMAND_TEXT_CHANNEL_ID;
